@@ -4,36 +4,44 @@ import torch.nn as nn
 import math
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
-
-print("CUDA Available:", torch.cuda.is_available())
-
-if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
+import os
+from datetime import datetime
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
+tokenizer = None
 
-data = pd.read_csv('eng-dutch.tsv', sep='\t', header=None, names=['eng_id', 'eng', 'd-id', 'dutch'])
+def get_tokenizer():
+    global tokenizer
+    if tokenizer is None:
+        raise RuntimeError("Tokenizer uninitialized.")
+    
+    return tokenizer
 
-pairs = []
-for _, row in data.iterrows():
-    pairs.append({'src': f'<2nl> {row.eng}', 'trg': f'<2en> {row.dutch}'})
-    pairs.append({'src': f'<2en> {row.dutch}', 'trg': f'<2nl> {row.eng}'})
+def init_tokenizer(data_file):
+    global tokenizer
 
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
+    data = pd.read_csv(data_file, sep='\t', header=None, names=['eng_id', 'eng', 'd-id', 'dutch'])
 
-tokenizer = Tokenizer(models.BPE())
-tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
+    pairs = []
+    for _, row in data.iterrows():
+        pairs.append({'src': f'<2nl> {row.eng}', 'trg': f'<2en> {row.dutch}'})
+        pairs.append({'src': f'<2en> {row.dutch}', 'trg': f'<2nl> {row.eng}'})
 
-trainer = trainers.BpeTrainer(
-    vocab_size=10000,
-    special_tokens=['<pad>', '<sos>', '<eos>', '<unk>', '<2en>', '<2nl>']
-)
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
 
-corpus = [pair['src'] for pair in pairs] + [pair['trg'] for pair in pairs]
-tokenizer.train_from_iterator(corpus, trainer)
+    trainer = trainers.BpeTrainer(
+        vocab_size=10000,
+        special_tokens=['<pad>', '<sos>', '<eos>', '<unk>', '<2en>', '<2nl>']
+    )
 
-tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
+    corpus = [pair['src'] for pair in pairs] + [pair['trg'] for pair in pairs]
+    tokenizer.train_from_iterator(corpus, trainer)
+    tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
+
+    return pairs
 
 class TranslationDataset(Dataset):
     def __init__(self, pairs, tokenizer, max_length=100):
@@ -47,7 +55,9 @@ class TranslationDataset(Dataset):
     def __getitem__(self, idx):
         pair = self.pairs[idx]
         src = self.tokenizer.encode(pair['src']).ids[:self.max_length]
-        trg = [self.tokenizer.token_to_id('<sos>')] + self.tokenizer.encode(pair['trg']).ids[:self.max_length-2] + [self.tokenizer.token_to_id('<eos>')]
+        trg = [self.tokenizer.token_to_id('<sos>')] + \
+        self.tokenizer.encode(pair['trg']).ids[:self.max_length-2] + \
+        [self.tokenizer.token_to_id('<eos>')]
         return torch.tensor(src), torch.tensor(trg)
 
 def collate_fn(batch):
@@ -55,9 +65,6 @@ def collate_fn(batch):
     src_padded = pad_sequence(src_batch, padding_value=tokenizer.token_to_id('<pad>'), batch_first=True)
     trg_padded = pad_sequence(trg_batch, padding_value=tokenizer.token_to_id('<pad>'), batch_first=True)
     return src_padded, trg_padded
-
-dataset = TranslationDataset(pairs, tokenizer)
-dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn, shuffle=True)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -73,7 +80,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(1), :]
 
 class Transformer(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=2048, dropout=0.1):
+    def __init__(self, vocab_size, d_model=256, nhead=4, num_encoder_layers=3, num_decoder_layers=3, dim_feedforward=2048, dropout=0.1):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
@@ -102,32 +109,99 @@ class Transformer(nn.Module):
             memory_key_padding_mask=src_padding_mask,
             tgt_mask=trg_mask
         )
+
         return self.fc_out(output)
+    
+    @staticmethod
+    def generate_square_subsequent_mask(sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+    
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0, checkpoint_dir='checkpoint'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.checkpoint_dir = checkpoint_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-vocab_size = tokenizer.get_vocab_size()
-model = Transformer(vocab_size).to(device)
+    def __call__(self, val_loss, model, optimizer, epoch):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.save_checkpoint(model, optimizer, epoch, val_loss)
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.save_checkpoint(model, optimizer, epoch, val_loss)
+            self.counter = 0
+    
+    def save_checkpoint(self, model, optimizer, epoch, loss):
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'model_checkpoint_{timestamp}_loss_{loss:.4f}.pt'
+        filepath = os.path.join(self.checkpoint_dir, filename)
 
-model.to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id('<pad>'))
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss,
 
-model.train()
-for epoch in range(10):
-    for src, trg in dataloader:
-        src, trg = src.to(device), trg.to(device)
-        trg_input = trg[:, :-1]
-        trg_output = trg[:, 1:]
+        }, filepath)
+        print(f"Saved checkpoint to {filepath}")
 
-        src_padding_mask = (src == tokenizer.token_to_id('<pad>')).to(device)
-        trg_padding_mask = (trg_input == tokenizer.token_to_id('<pad>')).to(device)
-        trg_mask = nn.Transformer.generate_square_subsequent_mask(trg_input.size(1)).to(device)
+def train_model(model, dataloader, num_epochs=10, patience=5):
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id('<pad>'))
+    early_stopping = EarlyStopping(patience=patience, min_delta=0.0001)
+    model.train()
 
-        optimizer.zero_grad()
-        output = model(src, trg_input, src_padding_mask, trg_padding_mask, trg_mask)
-        loss = criterion(output.reshape(-1, output.size(-1)), trg_output.reshape(-1))
-        loss.backward()
-        optimizer.step()
-    print(f'Epoch {epoch}, Loss: {loss.item()}')
+    for epoch in range(num_epochs):
+        total_loss = 0
+        batch_count = 0
+
+        for src, trg in dataloader:
+            src, trg = src.to(device), trg.to(device)
+            trg_input = trg[:, :-1]
+            trg_output = trg[:, 1:]
+
+            src_padding_mask = (src == tokenizer.token_to_id('<pad>')).to(device)
+            trg_padding_mask = (trg_input == tokenizer.token_to_id('<pad>')).to(device)
+            trg_mask = nn.Transformer.generate_square_subsequent_mask(trg_input.size(1)).to(device)
+
+            optimizer.zero_grad()
+            output = model(src, trg_input, src_padding_mask, trg_padding_mask, trg_mask)
+            loss = criterion(output.reshape(-1, output.size(-1)), trg_output.reshape(-1))
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            batch_count += 1
+
+        avg_loss = total_loss / batch_count
+        print(f'Epoch {epoch}, Loss: {loss.item()}, Avg Loss: {avg_loss}')
+
+        early_stopping(avg_loss, model, optimizer, epoch)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+def load_best_model(model, checkpoint_dir='checkpoint'):
+    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
+    if not checkpoints:
+        return
+    
+    best = sorted(checkpoints, key=lambda x: float(x.split('_loss_')[1].split('.pt')[0]))[0]
+    checkpoint_path = os.path.join(checkpoint_dir, best)
+
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"Loaded model from {checkpoint_path}")
 
 def translate(model, tokenizer, src_sentence, direction='en-nl', max_length=50):
     model.eval()
@@ -145,4 +219,17 @@ def translate(model, tokenizer, src_sentence, direction='en-nl', max_length=50):
             break
     return tokenizer.decode(trg_ids, skip_special_tokens=True)
 
-print(translate(model, tokenizer, 'Hello world!', 'eng-nl'))
+if __name__ == "__main__":
+    print("CUDA Available:", torch.cuda.is_available())
+
+    if torch.cuda.is_available():
+        print("GPU:", torch.cuda.get_device_name(0))
+
+    pairs = init_tokenizer('eng-dutch.tsv')
+    dataset = TranslationDataset(pairs, tokenizer)
+    dataloader = DataLoader(dataset, batch_size=64, collate_fn=collate_fn, shuffle=True)
+    vocab_size = tokenizer.get_vocab_size()
+    model = Transformer(vocab_size).to(device)
+    model.to(device)
+
+    train_model(model, dataloader)
