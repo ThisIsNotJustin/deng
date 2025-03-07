@@ -1,6 +1,6 @@
 # Deng (Dutch - English)
 
-PyTorch implementation of a Transformer model for translation between English and Dutch translation.
+PyTorch implementation of a Transformer model for translation between English and Dutch.
 
 ## Features
 
@@ -43,7 +43,7 @@ python test.py
 
 ## Dataset
 
-The model is trained on the Tatoeba English-Dutch sentences stored in TSV format with the following columns:
+The model is trained on the Tatoeba English-Dutch dataset stored in TSV format with the following columns:
 - eng_id: English sentence ID
 - eng: English sentence
 - d_id: Dutch sentence ID
